@@ -1,9 +1,9 @@
-# CODA — Computational Pathology Pipeline
+# CODA - Computational Pathology Pipeline
 
 A two-module pipeline for H&E histopathology whole-slide image (WSI) analysis:
 
-1. **Tissue Segmentation** — annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
-2. **Serial Section Alignment** — affine + elastic registration of consecutive tissue sections
+1. **Tissue Segmentation** - annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
+2. **Serial Section Alignment** - affine + elastic registration of consecutive tissue sections
 
 ---
 

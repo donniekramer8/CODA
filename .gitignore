@@ -2,6 +2,9 @@
 **/ignore/
 **/ignored/
 
+# Claude
+**/.claude
+
 # Model checkpoints
 **/checkpoints/
 **/*.pth
