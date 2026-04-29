@@ -5,6 +5,9 @@ A two-module pipeline for H&E histopathology whole-slide image (WSI) analysis:
 1. **Tissue Segmentation** — annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
 2. **Serial Section Alignment** — affine + elastic registration of consecutive tissue sections
 
+Adapted and refactored based on:
+Kiemen, A.L., Braxton, A.M., Grahn, M.P. et al. CODA: quantitative 3D reconstruction of large tissues at cellular resolution. Nat Methods 19, 1490–1499 (2022). https://doi.org/10.1038/s41592-022-01650-9
+
 ---
 
 ## Overview
