@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(conda run -n loki_env python -c \":*)",
-      "Bash(conda run:*)",
-      "Bash(python3 -c \":*)"
-    ]
-  }
-}
