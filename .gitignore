@@ -1,0 +1,55 @@
+# Ignored data/output folders
+**/ignore/
+**/ignored/
+
+# Model checkpoints
+**/checkpoints/
+**/*.pth
+**/*.pt
+
+# Compiled transforms / outputs
+**/*.pkl
+**/*.npy
+**/*.npz
+
+# Alignment outputs
+**/aligned/
+**/masks/
+**/transforms/
+**/alignment_results.json
+
+# Inference outputs
+**/*_labelmap.png
+**/*_colormap.png
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+runs/
