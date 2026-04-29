@@ -1,9 +1,9 @@
-# CODA - Computational Pathology Pipeline
+# CODA — Computational Pathology Pipeline
 
 A two-module pipeline for H&E histopathology whole-slide image (WSI) analysis:
 
-1. **Tissue Segmentation** - annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
-2. **Serial Section Alignment** - affine + elastic registration of consecutive tissue sections
+1. **Tissue Segmentation** — annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
+2. **Serial Section Alignment** — affine + elastic registration of consecutive tissue sections
 
 ---
 
@@ -14,17 +14,17 @@ Raw WSIs (.ndpi)
 │
 ├─── Annotate in Aperio ImageScope → export XML
 │         ↓
-│    Generate large mosaics (paired H&E image + annotation masks)
+│    [make_mosaic.ipynb]  Build large mosaic canvas from WSI + XML pairs
 │         ↓
-│    Random-crop into 256×256 tiles → .npz datasets
+│    [make_tiles.ipynb]   Random-crop into tiles → spatially split train/val → .npz
 │         ↓
-│    Train ConvNeXtUNet (semantic segmentation, N classes)
+│    [src/train.py]       Train ConvNeXtUNet (semantic segmentation, N classes)
 │         ↓
-│    Run inference on new WSIs (single or batch)
+│    [wsi_inference.py / batch_wsi_inference.py]  Run inference on new WSIs
 │
-└─── Alignment: register serial sections (affine → elastic)
+└─── [align_serial_sections.ipynb]  Register serial sections (affine → elastic)
           ↓
-     Aligned images, tissue masks, transform files
+     [apply_transforms.ipynb]  Warp segmentation masks using saved transforms
 ```
 
 ---
@@ -35,44 +35,82 @@ Raw WSIs (.ndpi)
 CODA/
 ├── tissue_segmentation/
 │   ├── src/
-│   │   ├── config.py              # Training hyperparameters & paths
-│   │   ├── model.py               # ConvNeXt-UNet architecture
-│   │   ├── dataset.py             # Data loading, augmentation, class weighting
-│   │   └── train.py               # Training loop, metrics, checkpointing
+│   │   ├── config.py                  # Training hyperparameters & paths
+│   │   ├── model.py                   # ConvNeXt-UNet architecture
+│   │   ├── dataset.py                 # Data loading, augmentation, class weighting
+│   │   └── train.py                   # Training loop, metrics, checkpointing
 │   ├── inference/
-│   │   ├── wsi_inference.py       # Inference on a single WSI
-│   │   └── batch_wsi_inference.py # Batch inference over a directory
+│   │   ├── wsi_inference.py           # Inference on a single WSI
+│   │   ├── batch_wsi_inference.py     # Batch inference over a directory
+│   │   └── test.ipynb                 # Visualize model predictions on .npz tiles
 │   └── tile_generation/
-│       └── util.py                # Annotation parsing, tile extraction, mosaic assembly
+│       ├── util.py                    # Annotation parsing, tile extraction, mosaic assembly
+│       ├── make_mosaic.ipynb          # Step 1: WSI + XML → mosaic canvas
+│       └── make_tiles.ipynb           # Step 2: mosaic → random-crop tile dataset
 └── alignment/
-    ├── alignment_pipeline.py      # Orchestration: sorting, anchoring, pass logic
-    └── registration.py            # Affine (ORB/ECC) + elastic (phase-correlation) registration
+    ├── alignment_pipeline.py          # Orchestration: sorting, anchoring, pass logic
+    ├── registration.py                # Affine (ORB/ECC) + elastic (phase-correlation) registration
+    ├── align_serial_sections.ipynb    # Run alignment pipeline interactively
+    └── apply_transforms.ipynb         # Warp new images using saved transforms
 ```
 
 ---
 
 ## Module 1: Tissue Segmentation
 
-### Step 1 — Annotate WSIs
+### Step 1 — Annotate WSIs in Aperio ImageScope
 
-Draw region annotations in **Aperio ImageScope** on `.ndpi` files. Each annotation layer corresponds to a tissue class. Export annotations as XML; the XML filename must match the WSI filename it was drawn on.
+Draw region annotations directly on `.ndpi` files in **Aperio ImageScope**. Each annotation layer name corresponds to a tissue class (e.g. `PDAC`, `Duct`, `ECM`, `Islet`). Export the annotations as an XML file — the XML filename must share the same stem as the WSI it was drawn on so the pipeline can auto-pair them.
 
-### Step 2 — Generate Tiles
+### Step 2 — Build Mosaic
 
-`tile_generation/util.py` provides the building blocks used to go from WSI + XML → training data:
+**Notebook:** [tissue_segmentation/tile_generation/make_mosaic.ipynb](tissue_segmentation/tile_generation/make_mosaic.ipynb)
 
-- **`read_annotations_xml()`** — parses Aperio XML into labeled polygon lists
-- **`cluster_annotations()`** — groups overlapping annotations via Union-Find
-- **`build_mosaic()`** — stochastically assembles extracted tiles onto a large canvas (default 10240×10240), handling rotation and overlap penalties to maximize fill
-- **`make_segmentation_mask()`** — rasterizes polygons into integer label maps
+This notebook takes a directory of matched `.ndpi` / `.xml` pairs and builds a large mosaic canvas containing the annotated regions from all slides.
 
-The output is `.npz` files containing:
-- `he` — uint8 RGB image tiles
-- `masks` — integer label arrays (0 = background, 1–9 = tissue classes)
+**What to configure at the top of the notebook:**
 
-### Step 3 — Train
+| Variable | Description |
+|---|---|
+| `SLIDE_DIR` | Directory containing matched `.ndpi` + `.xml` pairs (same filename stem) |
+| `LEVEL` | WSI pyramid level to read (higher = faster, lower resolution) |
+| `CANVAS_SIZE` | Side length of the output mosaic canvas in pixels (default `20480`) |
+| `PRIORITY_ORDER` | List of annotation label names, highest priority last (controls label painting order) |
 
-Edit `src/config.py` to point at your `.npz` dataset files, then:
+**What it does:**
+1. Discovers all `.ndpi` / `.xml` pairs in `SLIDE_DIR`
+2. Parses annotation polygons from each XML (`read_annotations_xml`)
+3. Clusters overlapping annotations (`cluster_annotations`)
+4. Extracts paired H&E image + segmentation mask for each cluster (`read_region`, `make_segmentation_mask`)
+5. Stochastically packs all extracted regions onto the mosaic canvas (`build_mosaic`), with rotation and overlap-penalty scoring to maximize fill
+6. Saves two files: `mosaic_he.png` (RGB) and `mosaic_mask.png` (integer label map)
+
+### Step 3 — Generate Tile Dataset
+
+**Notebook:** [tissue_segmentation/tile_generation/make_tiles.ipynb](tissue_segmentation/tile_generation/make_tiles.ipynb)
+
+Reads the saved mosaic and randomly crops it into fixed-size tiles with a spatially-guaranteed train/validation split.
+
+**What to configure:**
+
+| Variable | Description |
+|---|---|
+| `MOSAIC_DIR` | Path to directory containing `mosaic_he.png` and `mosaic_mask.png` |
+| `TILE_SIZE` | Tile size in pixels (default `1024`) |
+| `MIN_TISSUE_FRAC` | Minimum fraction of tile pixels that must be non-background (default `0.3`) |
+| `TARGET_TILES` | Number of training tiles to collect |
+| `N_VAL_TILES` | Number of validation tiles (sampled first; training tiles are guaranteed non-overlapping) |
+
+**What it does:**
+1. Loads the mosaic pair
+2. Computes class-frequency distribution and flags rare classes for oversampling
+3. Samples `N_VAL_TILES` non-overlapping tiles for validation
+4. Samples up to `TARGET_TILES` training tiles from positions with zero pixel overlap with validation tiles
+5. Saves `tiles_train.npz` and `tiles_val.npz` — each contains `he` (uint8 RGB stack) and `masks` (integer label stack)
+
+### Step 4 — Train
+
+Edit [tissue_segmentation/src/config.py](tissue_segmentation/src/config.py) to point `TRAIN_NPZ` and `VAL_NPZ` at your `.npz` files, then:
 
 ```bash
 cd tissue_segmentation
@@ -84,8 +122,8 @@ Key config options:
 | Parameter | Default | Description |
 |---|---|---|
 | `BACKBONE` | `convnext_tiny` | ConvNeXt variant (`tiny`, `base`, `large`) |
-| `NUM_CLASSES` | `10` | Number of segmentation classes (including background) |
-| `TILE_SIZE` | `256` | Input tile size (pixels) |
+| `NUM_CLASSES` | `10` | Segmentation classes including background |
+| `TILE_SIZE` | `256` | Input tile size in pixels |
 | `BATCH_SIZE` | `4` | Training batch size |
 | `LR` | `1e-4` | Initial learning rate |
 | `MAX_EPOCHS` | `100` | Maximum training epochs |
@@ -97,9 +135,17 @@ Training uses:
 - **AMP**: Mixed precision enabled by default
 - **Augmentation**: Flips, rotation, color jitter, Gaussian blur, elastic deformation (albumentations)
 
-Checkpoints are written to `src/checkpoints/` — best model by validation Dice score plus periodic saves every 10 epochs.
+Checkpoints are written to `src/checkpoints/` — best model by validation Dice score, plus periodic saves every 10 epochs.
 
-### Step 4 — Inference
+### Step 5 — Inspect Predictions
+
+**Notebook:** [tissue_segmentation/inference/test.ipynb](tissue_segmentation/inference/test.ipynb)
+
+Loads a checkpoint and an `.npz` tile file and visualizes model predictions side-by-side with ground-truth masks. Useful for sanity-checking a trained model before running full WSI inference.
+
+Set `pth_model` to the checkpoint path and `pth_data` to the `.npz` file path at the top of the notebook.
+
+### Step 6 — Inference on WSIs
 
 **Single WSI:**
 
@@ -120,7 +166,7 @@ python inference/batch_wsi_inference.py \
 ```
 
 Inference pipeline:
-1. Green-channel tissue masking to skip background
+1. Green-channel tissue masking to skip background regions
 2. 1024×1024 tiles with 128-pixel overlap
 3. Gaussian-weighted blending to eliminate tile boundary artifacts
 4. Output: integer label map + optional colormap PNG
@@ -131,7 +177,7 @@ Key inference flags:
 |---|---|---|
 | `--level` | `0` | WSI pyramid level to read |
 | `--tile-size` | `1024` | Inference tile size |
-| `--overlap` | `128` | Overlap between tiles |
+| `--overlap` | `128` | Overlap between adjacent tiles |
 | `--scale` | `4` | Output downscale factor |
 | `--no-colormap` | — | Skip colormap PNG output |
 
@@ -141,39 +187,39 @@ Key inference flags:
 
 Registers consecutive H&E sections from serially cut tissue blocks.
 
-### Usage
+### Step 1 — Run Alignment
 
-```bash
-python alignment/alignment_pipeline.py \
-    --input /path/to/slides/ \
-    --output /path/to/aligned/ \
-    --level 3
-```
+**Notebook:** [alignment/align_serial_sections.ipynb](alignment/align_serial_sections.ipynb)
 
-### Pipeline Logic
+The recommended way to run alignment. Provides slide previews, a live summary table, per-slide IoU bar chart, and side-by-side visual checks of aligned sections.
 
+**What to configure:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `SLIDE_FOLDER` | — | Directory containing `.ndpi` files |
+| `OUTPUT_FOLDER` | — | Where to save aligned images and transforms |
+| `LEVEL` | `5` | Pyramid level for registration (higher = faster) |
+| `IOU_THRESHOLD` | `0.87` | Min tissue IoU to accept an alignment |
+| `MAX_SKIP` | `2` | Max consecutive damaged slides to skip |
+| `AFFINE_METHOD` | `ORB` | `ORB`, `ECC`, or `combined` |
+| `DO_ELASTIC` | `True` | Whether to run elastic registration after affine |
+
+**Pipeline logic:**
 1. Slides are discovered and sorted by trailing number in filename
 2. The middle slide is selected as the anchor (no transform applied)
-3. A **forward pass** registers slides from middle+1 → end
-4. A **backward pass** registers slides from middle-1 → 0
+3. A **forward pass** registers slides middle+1 → end
+4. A **backward pass** registers slides middle-1 → 0
 5. Each slide registers to the most recent successfully-aligned neighbor
-6. If registration IoU falls below `--iou-threshold`, the pipeline skips up to `--max-skip` slides (damage handling)
+6. If IoU falls below `IOU_THRESHOLD`, the pipeline skips up to `MAX_SKIP` slides (damage/artifact handling)
 
-### Registration
+**Registration per pair:**
+1. **Affine** — ORB feature matching → RANSAC, or ECC intensity-based, or ORB-initialized multi-scale ECC
+2. **Elastic** — sparse phase-correlation grid → Gaussian-smoothed displacement field → thin-plate-spline dense field
 
-Two-stage per pair:
-
-1. **Affine** — choice of method via `--method`:
-   - `orb`: ORB feature matching → RANSAC affine
-   - `ecc`: Enhanced Correlation Coefficient (intensity-based)
-   - `combined` *(default)*: ORB coarse initialization → multi-scale ECC refinement
-
-2. **Elastic** — sparse phase-correlation on a grid of patches → Gaussian-smoothed displacement field → thin-plate-spline interpolation to dense field
-
-### Output
-
+**Output:**
 ```
-output/
+OUTPUT_FOLDER/
 ├── aligned/          # Registered PNG images
 ├── masks/            # Tissue masks
 ├── transforms/
@@ -182,42 +228,56 @@ output/
 └── alignment_results.json
 ```
 
-Key alignment flags:
+### Step 2 — Apply Transforms to Other Images
 
-| Flag | Default | Description |
-|---|---|---|
-| `--level` | `3` | Pyramid level for registration |
-| `--method` | `combined` | Affine method: `orb`, `ecc`, `combined` |
-| `--iou-threshold` | `0.5` | Minimum tissue overlap to accept registration |
-| `--max-skip` | `3` | Max consecutive slides to skip when looking for a better match |
-| `--padding` | `200` | White border added to anchor image |
+**Notebook:** [alignment/apply_transforms.ipynb](alignment/apply_transforms.ipynb)
+
+Use this after alignment to warp a separate set of images (e.g. segmentation label maps) using the already-computed transforms. This avoids re-running registration — the transforms are loaded from the saved `.pkl` / `.npy` files and applied at the correct scale.
+
+**What to configure:**
+
+| Variable | Description |
+|---|---|
+| `ALIGNMENT_OUTPUT_FOLDER` | Output folder from the alignment run (contains `transforms/`) |
+| `NEW_IMAGE_FOLDER` | Directory of images to warp (e.g. segmentation PNGs) |
+| `ORIGINAL_SLIDE_FOLDER` | Original `.ndpi` files used during alignment (needed for scale calculation) |
+| `REGISTRATION_LEVEL` | Pyramid level that was used during alignment |
+| `SEG_DOWNSAMPLE` | Downscale factor of the new images relative to level-0 |
+| `IS_LABEL_MAP` | `True` to use nearest-neighbor interpolation (label maps); `False` for bilinear |
 
 ---
 
-## Dependencies
+## Environment Setup
 
-```
-torch
-torchvision
-albumentations
-opencv-python
-scikit-image
-scipy
-pyvips
-Pillow
-tifffile
-numpy
-matplotlib
-tqdm
-```
+A conda environment file is provided at [environment.yml](environment.yml).
 
-Install with:
+**1. Install system dependency for pyvips (Ubuntu/Debian):**
 
 ```bash
-pip install torch torchvision albumentations opencv-python scikit-image scipy pyvips Pillow tifffile numpy matplotlib tqdm
+sudo apt install libvips-dev
 ```
 
-> **Note**: `pyvips` requires the libvips system library. On Ubuntu/Debian: `sudo apt install libvips-dev`
+**2. Create and activate the environment:**
+
+```bash
+conda env create -f environment.yml
+conda activate coda_env
+```
+
+**3. Register the environment as a Jupyter kernel (for notebooks):**
+
+```bash
+python -m ipykernel install --user --name coda_env --display-name "CODA"
+```
+
+**CUDA version:** The `environment.yml` defaults to CUDA 12.1 (`cu121`). If your system uses a different CUDA version, edit the two `torch` / `torchvision` lines before creating the environment:
+
+| Your CUDA | Change `cu121` to |
+|---|---|
+| CUDA 11.8 | `cu118` |
+| CPU only | `cpu` (and remove `+cu121` suffix) |
+
+Check your CUDA version with `nvidia-smi`.
 
 ---
 

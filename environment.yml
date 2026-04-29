@@ -1,0 +1,35 @@
+name: coda_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+
+  - pip:
+    # PyTorch — CUDA 12.1 build (change cu121 → cu118 for CUDA 11.8, or to cpu for CPU-only)
+    - torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+    - torchvision==0.18.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+
+    # Core vision / ML
+    - albumentations==2.0.8
+    - opencv-python==4.10.0.84
+    - scikit-image==0.24.0
+    - scikit-learn==1.6.1
+    - scipy==1.13.1
+
+    # WSI I/O
+    - pyvips==3.0.0
+    - tifffile==2023.2.28
+    - Pillow==10.4.0
+
+    # Data / compute
+    - numpy==2.0.2
+    - tqdm==4.66.5
+    - matplotlib==3.9.2
+
+    # Notebooks
+    - jupyterlab
+    - ipykernel
