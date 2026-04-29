@@ -18,7 +18,7 @@ Raw WSIs (.ndpi)
 │         ↓
 │    Random-crop into 256×256 tiles → .npz datasets
 │         ↓
-│    Train ConvNeXtUNet (semantic segmentation, 10 classes)
+│    Train ConvNeXtUNet (semantic segmentation, N classes)
 │         ↓
 │    Run inference on new WSIs (single or batch)
 │
@@ -32,7 +32,7 @@ Raw WSIs (.ndpi)
 ## Repository Structure
 
 ```
-CODA_my_version/
+CODA/
 ├── tissue_segmentation/
 │   ├── src/
 │   │   ├── config.py              # Training hyperparameters & paths

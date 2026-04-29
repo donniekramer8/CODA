@@ -7,9 +7,6 @@
 **/*.pth
 **/*.pt
 
-# Claude
-**/.claude
-
 # Compiled transforms / outputs
 **/*.pkl
 **/*.npy
