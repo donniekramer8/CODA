@@ -19,7 +19,7 @@ import tifffile
 from PIL import Image
 
 from registration import (
-    read_ndpi_level,
+    read_ndpi_at_target_level,
     get_level_dimensions,
     get_scale_factor,
     tissue_mask,
@@ -27,6 +27,14 @@ from registration import (
     register_pair,
     _bg_color,
 )
+
+
+def _read_level(path: str, level: int) -> np.ndarray:
+    """Read a slide at the resolution corresponding to `level`, ensuring a
+    consistent effective downsample even if the slide's pyramid doesn't have
+    a proper level at that depth."""
+    arr, _, _ = read_ndpi_at_target_level(path, target_level=level)
+    return arr
 
 
 # File discovery and sorting
@@ -195,9 +203,9 @@ def align_serial_sections(
         if verbose:
             print(f"Anchor [{mid}] already done - loading from disk.")
         cached = _load_aligned_image(mid)
-        anchor_img = cached if cached is not None else _pad_image(read_ndpi_level(slides[mid], level=level))
+        anchor_img = cached if cached is not None else _pad_image(_read_level(slides[mid], level))
     else:
-        anchor_raw = read_ndpi_level(slides[mid], level=level)
+        anchor_raw = _read_level(slides[mid], level)
         anchor_img = _pad_image(anchor_raw)
         if verbose and padding > 0:
             print(f"  Anchor padded: {anchor_raw.shape[:2]} -> {anchor_img.shape[:2]} (padding={padding}px)")
@@ -255,7 +263,7 @@ def align_serial_sections(
                       f"-> reference [{ref_idx}]")
 
             # Pad moving image to same canvas as anchor
-            moving_img = _pad_image(read_ndpi_level(slides[idx], level=level))
+            moving_img = _pad_image(_read_level(slides[idx], level))
             slide_stem = Path(slides[idx]).stem
 
             aligned, aligned_mask, iou, M, displacement = register_pair(
@@ -318,7 +326,7 @@ def align_serial_sections(
                 ahead_imgs = {}
                 for skip_idx in ahead_candidates:
                     #  Pad skip candidate too
-                    skip_img = _pad_image(read_ndpi_level(slides[skip_idx], level=level))
+                    skip_img = _pad_image(_read_level(slides[skip_idx], level))
                     skip_stem = Path(slides[skip_idx]).stem
                     ahead_imgs[skip_idx] = (skip_img, skip_stem)
                     if verbose:
