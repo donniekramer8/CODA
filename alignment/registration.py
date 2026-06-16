@@ -138,12 +138,18 @@ def tissue_mask(
     g = he_image[:, :, 1]
     tissue = (g < g_thresh).astype(np.uint8)
 
-    # Fill small background holes
+    # Fill small background holes. Vectorized: build a per-label lookup of which
+    # background components are too small, then map it across the label image in
+    # one pass. (A per-label Python loop with `labels == lid` rescans the whole
+    # image for every component — pathologically slow when a noisy background at
+    # high resolution produces tens of thousands of tiny components.)
     bg = 1 - tissue
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bg, connectivity=8)
-    for lid in range(1, n_labels):
-        if stats[lid, cv2.CC_STAT_AREA] < min_bg_pixels:
-            tissue[labels == lid] = 1
+    if n_labels > 1:
+        small = stats[:, cv2.CC_STAT_AREA] < min_bg_pixels
+        small[0] = False  # label 0 is the tissue side of `bg`, never fill it
+        fill = small[labels]            # (H, W) bool, one vectorized lookup
+        tissue[fill] = 1
 
     return tissue.astype(bool)
 
@@ -155,6 +161,61 @@ def compute_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     if union == 0:
         return 0.0
     return float(intersection / union)
+
+
+def masked_ncc(
+    fixed_gray: np.ndarray,
+    moving_gray: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> float:
+    """Normalized cross-correlation of two grayscale images over a mask.
+
+    Unlike IoU (which only sees the tissue silhouette), NCC sees internal
+    texture — so it actually rewards fine elastic alignment of structures
+    inside the tissue. Returned in [-1, 1]; higher is better.
+    """
+    f = fixed_gray.astype(np.float32)
+    m = moving_gray.astype(np.float32)
+    if mask is not None:
+        sel = mask.astype(bool)
+    else:
+        sel = np.ones(f.shape[:2], dtype=bool)
+    if sel.sum() < 16:
+        return 0.0
+    fv = f[sel]
+    mv = m[sel]
+    fv = fv - fv.mean()
+    mv = mv - mv.mean()
+    denom = np.sqrt((fv * fv).sum() * (mv * mv).sum())
+    if denom < 1e-8:
+        return 0.0
+    return float((fv * mv).sum() / denom)
+
+
+def compose_displacements(
+    disp_a: np.ndarray,
+    disp_b: np.ndarray,
+) -> np.ndarray:
+    """Compose two displacement fields so applying the result once equals
+    applying disp_a then disp_b (both consumed by apply_elastic_transform,
+    i.e. cv2.remap pullback: out(x) = in(x + disp)).
+
+    For pullback warps, warping by disp_a then disp_b samples the source at
+    x + disp_b(x) + disp_a(x + disp_b(x)). We resample disp_a at the
+    disp_b-displaced coordinates and add.
+    """
+    H, W = disp_b.shape[:2]
+    row, col = np.mgrid[0:H, 0:W]
+    map_x = (col + disp_b[:, :, 0]).astype(np.float32)
+    map_y = (row + disp_b[:, :, 1]).astype(np.float32)
+    a_x = cv2.remap(disp_a[:, :, 0], map_x, map_y, cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE)
+    a_y = cv2.remap(disp_a[:, :, 1], map_x, map_y, cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE)
+    out = np.empty_like(disp_b)
+    out[:, :, 0] = disp_b[:, :, 0] + a_x
+    out[:, :, 1] = disp_b[:, :, 1] + a_y
+    return out
 
 
 # ── Pre-processing ─────────────────────────────────────────────────────────────
@@ -315,9 +376,9 @@ def _affine_orb(
     pts_f = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     pts_m = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-    # estimateAffinePartial2D for rigid+scale, or estimateAffine2D for full affine
+    # Full 6-DOF affine (translation + rotation + scale + shear).
     M, inliers = cv2.estimateAffine2D(pts_m, pts_f, method=cv2.RANSAC,
-                                       ransacReprojThreshold=5.0)
+                                      ransacReprojThreshold=5.0)
     if M is None:
         return None, 0.0
 
@@ -366,21 +427,20 @@ def apply_affine(
 # ── Elastic: sparse-grid phase-correlation (MATLAB port) ──────────────────────
 
 def _phase_correlation_shift(patch_fixed: np.ndarray, patch_moving: np.ndarray) -> Tuple[float, float]:
-    """Sub-pixel translation estimate via normalised cross-power spectrum.
+    """Sub-pixel translation estimate via phase correlation.
 
-    Equivalent to MATLAB's `calculate_transform` / `reg_ims_ELS` internals.
-    Returns (dx, dy) shift that aligns moving → fixed.
+    Uses cv2.phaseCorrelate (Hanning-windowed cross-power spectrum with
+    sub-pixel peak fitting), which is far more accurate than a hand-rolled
+    argmax over the inverse FFT — the latter has no windowing, so spectral
+    leakage biases the peak toward (0, 0) and yields near-zero shifts.
+
+    Returns (dx, dy) such that patch_moving shifted by (dx, dy) aligns to
+    patch_fixed.
     """
-    f1 = np.fft.fft2(patch_fixed.astype(np.float32))
-    f2 = np.fft.fft2(patch_moving.astype(np.float32))
-    denom = np.abs(f1 * np.conj(f2))
-    denom[denom == 0] = 1e-10
-    R = (f1 * np.conj(f2)) / denom
-    r = np.fft.ifft2(R).real
-    idx = np.unravel_index(np.argmax(r), r.shape)
-    h, w = r.shape
-    dy = idx[0] if idx[0] < h // 2 else idx[0] - h
-    dx = idx[1] if idx[1] < w // 2 else idx[1] - w
+    f = np.ascontiguousarray(patch_fixed, dtype=np.float32)
+    m = np.ascontiguousarray(patch_moving, dtype=np.float32)
+    win = cv2.createHanningWindow((f.shape[1], f.shape[0]), cv2.CV_32F)
+    (dx, dy), _resp = cv2.phaseCorrelate(f, m, win)
     return float(dx), float(dy)
 
 
@@ -401,16 +461,22 @@ def _reg_ims_els(patch_moving: np.ndarray, patch_fixed: np.ndarray, downsample: 
     f_ds = cv2.resize(patch_fixed,  (nw, nh), interpolation=cv2.INTER_AREA)
     m_ds = cv2.resize(patch_moving, (nw, nh), interpolation=cv2.INTER_AREA)
 
+    # phaseCorrelate(a, b) returns the shift to apply to b to align it to a.
+    # The two calls measure the SAME displacement in opposite directions
+    # (fixed->moving vs moving->fixed), so to average them we must subtract:
+    #   est = (shift(fixed,moving) - shift(moving,fixed)) / 2
+    # Adding them cancels the signal to ~0 (they are equal and opposite).
     dx1, dy1 = _phase_correlation_shift(f_ds, m_ds)
     dx2, dy2 = _phase_correlation_shift(m_ds, f_ds)
 
-    # Average forward and backward (MATLAB: xyt = mean([xy1; -xy2]))
-    dx = (dx1 - (-dx2)) / 2   # == mean([dx1, -(-dx2)])... matches MATLAB sign convention
-    dy = (dy1 - (-dy2)) / 2
+    dx = (dx1 - dx2) / 2
+    dy = (dy1 - dy2) / 2
 
-    # Scale back to full resolution (MATLAB: X = -(xyt(1)*rf))
-    X = -(dx * downsample)
-    Y = -(dy * downsample)
+    # Scale back to full resolution. The displacement is consumed by
+    # apply_elastic_transform via cv2.remap (map = coord + disp), which is a
+    # pullback, so the sign here is correct as-is (no negation).
+    X = dx * downsample
+    Y = dy * downsample
     return X, Y
 
 
@@ -425,6 +491,7 @@ def elastic_registration(
     tissue_cutoff: float = 0.15,
     downsample: int = 2,
     smooth_sigma: float = 2.0,
+    rbf_smoothing: float = 0.1,
 ) -> np.ndarray:
     """Sparse-grid elastic registration via tile-wise phase correlation.
 
@@ -527,8 +594,123 @@ def elastic_registration(
 
     # ── Smooth + interpolate sparse → dense (MATLAB: make_final_grids) ────
     dense = _make_dense_field(disp_x, disp_y, xg, yg, H, W, bf,
-                               SENTINEL, smooth_sigma)
+                               SENTINEL, smooth_sigma, rbf_smoothing)
     return dense
+
+
+def elastic_registration_multipass(
+    fixed_gray: np.ndarray,
+    moving_gray: np.ndarray,
+    fixed_mask: Optional[np.ndarray] = None,
+    moving_mask: Optional[np.ndarray] = None,
+    tile_size: int = 400,
+    buffer: int = 200,
+    grid_spacing: int = 150,
+    tissue_cutoff: float = 0.15,
+    downsample: int = 2,
+    smooth_sigma: float = 2.0,
+    rbf_smoothing: float = 0.1,
+    n_passes: int = 3,
+    spacing_decay: float = 0.6,
+    tile_decay: float = 0.7,
+    keep_if_improves: bool = True,
+    min_ncc_gain: float = 1e-4,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Iterative coarse-to-fine elastic registration.
+
+    Runs `elastic_registration` repeatedly. Each pass measures the *residual*
+    misalignment on the already-warped moving image, then composes the new
+    field onto the accumulated one. Grid spacing and tile size shrink each
+    pass (coarse-to-fine), so early passes fix large smooth warps and later
+    passes fix fine local detail — yielding much stronger alignment than a
+    single pass for near-identical serial sections.
+
+    A pass is kept only if it improves masked grayscale NCC (when
+    `keep_if_improves`), so an occasional bad pass (low-texture region,
+    spurious tile) cannot degrade a good alignment.
+
+    Args:
+        n_passes:      Number of refinement passes.
+        spacing_decay: Per-pass multiplier on grid_spacing (finer over time).
+        tile_decay:    Per-pass multiplier on tile_size.
+        keep_if_improves: Revert a pass if NCC does not improve.
+        min_ncc_gain:  Minimum NCC improvement to accept a pass.
+
+    Returns:
+        Accumulated dense displacement field (H, W, 2) float32.
+    """
+    H, W = fixed_gray.shape[:2]
+    accum = np.zeros((H, W, 2), dtype=np.float32)
+
+    def _warp_gray(disp):
+        return apply_elastic_transform(
+            moving_gray, disp, (H, W),
+            default_value=float(np.median(moving_gray)),
+        )
+
+    def _warp_mask(disp):
+        if moving_mask is None:
+            return None
+        return apply_elastic_transform(
+            moving_mask.astype(np.uint8), disp, (H, W),
+            default_value=0.0, is_label=True,
+        ).astype(bool)
+
+    # Score region: intersection of both tissue masks (where comparison is meaningful)
+    def _score(warped_gray, warped_mask):
+        if fixed_mask is not None and warped_mask is not None:
+            region = fixed_mask & warped_mask
+        elif fixed_mask is not None:
+            region = fixed_mask
+        else:
+            region = warped_mask
+        return masked_ncc(fixed_gray, warped_gray, region)
+
+    cur_ncc = _score(moving_gray, moving_mask)
+    if verbose:
+        print(f"    [elastic-mp] start NCC={cur_ncc:.4f}", flush=True)
+
+    sp = float(grid_spacing)
+    ts = float(tile_size)
+    for p in range(n_passes):
+        sp_p = max(int(round(sp)), 8)
+        ts_p = max(int(round(ts)), 32)
+
+        warped_moving = _warp_gray(accum)
+        warped_mvmask = _warp_mask(accum)
+
+        residual = elastic_registration(
+            fixed_gray, warped_moving,
+            fixed_mask=fixed_mask,
+            moving_mask=warped_mvmask if warped_mvmask is not None else None,
+            tile_size=ts_p, buffer=buffer, grid_spacing=sp_p,
+            tissue_cutoff=tissue_cutoff, downsample=downsample,
+            smooth_sigma=smooth_sigma, rbf_smoothing=rbf_smoothing,
+        )
+
+        candidate = compose_displacements(accum, residual)
+        cand_gray = _warp_gray(candidate)
+        cand_mask = _warp_mask(candidate)
+        cand_ncc = _score(cand_gray, cand_mask)
+
+        gain = cand_ncc - cur_ncc
+        accept = (not keep_if_improves) or (gain >= min_ncc_gain)
+        if verbose:
+            tag = "keep" if accept else "drop"
+            print(f"    [elastic-mp] pass {p+1}/{n_passes} "
+                  f"tile={ts_p} spacing={sp_p} NCC {cur_ncc:.4f}->{cand_ncc:.4f} "
+                  f"({gain:+.4f}) [{tag}]", flush=True)
+
+        if accept:
+            accum = candidate
+            cur_ncc = cand_ncc
+        # else: keep accum, but still shrink grid for the next try
+
+        sp *= spacing_decay
+        ts *= tile_decay
+
+    return accum
 
 
 def _make_dense_field(
@@ -539,6 +721,7 @@ def _make_dense_field(
     H: int, W: int, bf: int,
     sentinel: float,
     smooth_sigma: float,
+    rbf_smoothing: float = 0.1,
 ) -> np.ndarray:
     """Smooth valid sparse displacements and interpolate to a dense (H, W, 2) field."""
 
@@ -559,9 +742,9 @@ def _make_dense_field(
     dy_grid = np.where(disp_y != sentinel, disp_y, 0.0)
     w_grid  = valid.astype(np.float32)
 
-    dx_smooth = gaussian_filter(dx_grid * w_grid, sigma=smooth_sigma)
-    dy_smooth = gaussian_filter(dy_grid * w_grid, sigma=smooth_sigma)
-    w_smooth  = gaussian_filter(w_grid,            sigma=smooth_sigma)
+    dx_smooth = gaussian_filter(dx_grid * w_grid, sigma=smooth_sigma, mode="nearest")
+    dy_smooth = gaussian_filter(dy_grid * w_grid, sigma=smooth_sigma, mode="nearest")
+    w_smooth  = gaussian_filter(w_grid,            sigma=smooth_sigma, mode="nearest")
     w_smooth  = np.maximum(w_smooth, 1e-8)
     dx_smooth /= w_smooth
     dy_smooth /= w_smooth
@@ -570,19 +753,44 @@ def _make_dense_field(
     vals_xs = dx_smooth[valid]
     vals_ys = dy_smooth[valid]
 
-    # RBF interpolation to dense grid
-    # Use thin-plate-spline via RBFInterpolator (scipy >= 1.7)
-    query_rows, query_cols = np.mgrid[0:H, 0:W]
-    query_pts = np.stack([query_cols.ravel(), query_rows.ravel()], axis=-1).astype(np.float64)
-    src_pts   = pts.astype(np.float64)
+    # RBF interpolation (thin-plate-spline) to a dense field.
+    #
+    # The displacement field is smooth by construction (sparse control points,
+    # heavily regularised), so we evaluate the expensive TPS on a coarse grid
+    # and bilinearly upsample to full (H, W). Evaluating TPS at every pixel is
+    # O(H*W*N) and dominated runtime; the coarse-eval result is visually
+    # identical but 1-2 orders of magnitude faster.
+    src_pts = pts.astype(np.float64)
+
+    # Coarse grid resolution: cap the longest side so cost is independent of
+    # the working level / image size. ~512 px on the long edge is plenty for a
+    # field this smooth.
+    max_coarse = 512
+    scale = min(1.0, max_coarse / max(H, W))
+    cH = max(int(round(H * scale)), 2)
+    cW = max(int(round(W * scale)), 2)
+
+    # Coarse query points in full-resolution coordinates.
+    coarse_cols = np.linspace(0, W - 1, cW)
+    coarse_rows = np.linspace(0, H - 1, cH)
+    qc, qr = np.meshgrid(coarse_cols, coarse_rows)
+    query_pts = np.stack([qc.ravel(), qr.ravel()], axis=-1).astype(np.float64)
 
     try:
-        rbf_x = RBFInterpolator(src_pts, vals_xs, kernel="thin_plate_spline", smoothing=1.0)
-        rbf_y = RBFInterpolator(src_pts, vals_ys, kernel="thin_plate_spline", smoothing=1.0)
-        dense_x = rbf_x(query_pts).reshape(H, W).astype(np.float32)
-        dense_y = rbf_y(query_pts).reshape(H, W).astype(np.float32)
+        rbf_x = RBFInterpolator(src_pts, vals_xs, kernel="thin_plate_spline", smoothing=rbf_smoothing)
+        rbf_y = RBFInterpolator(src_pts, vals_ys, kernel="thin_plate_spline", smoothing=rbf_smoothing)
+        coarse_x = rbf_x(query_pts).reshape(cH, cW).astype(np.float32)
+        coarse_y = rbf_y(query_pts).reshape(cH, cW).astype(np.float32)
     except Exception:
         return np.zeros((H, W, 2), dtype=np.float32)
+
+    # Upsample coarse field to full resolution (displacement magnitudes are in
+    # pixels and resolution-independent, so no rescaling of values is needed).
+    if (cH, cW) != (H, W):
+        dense_x = cv2.resize(coarse_x, (W, H), interpolation=cv2.INTER_LINEAR)
+        dense_y = cv2.resize(coarse_y, (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        dense_x, dense_y = coarse_x, coarse_y
 
     return np.stack([dense_x, dense_y], axis=-1)
 
@@ -656,6 +864,9 @@ def register_pair(
     grid_spacing: int = 150,
     tissue_cutoff: float = 0.15,
     iou_threshold: float = 0.0,
+    elastic_passes: int = 3,
+    rbf_smoothing: float = 0.1,
+    keep_if_improves: bool = True,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray], Optional[np.ndarray]]:
     """Full registration pipeline for one (fixed, moving) pair.
@@ -704,15 +915,17 @@ def register_pair(
 
     # 2. Elastic — only runs if affine IoU meets the threshold
     displacement = None
+    iou = iou_affine
     if do_elastic:
         if iou_affine < iou_threshold:
             if verbose:
                 print(f"    [elastic] skipped (affine IoU {iou_affine:.4f} < threshold {iou_threshold})", flush=True)
         else:
             if verbose:
-                print(f"    [elastic] tile={tile_size} buf={buffer} spacing={grid_spacing} ...", flush=True)
+                print(f"    [elastic] tile={tile_size} buf={buffer} spacing={grid_spacing} "
+                      f"passes={elastic_passes} smoothing={rbf_smoothing} ...", flush=True)
             aligned_gray = _to_gray(aligned)
-            displacement = elastic_registration(
+            displacement = elastic_registration_multipass(
                 fixed_gray, aligned_gray,
                 fixed_mask=fixed_mask,
                 moving_mask=aligned_mask,
@@ -720,6 +933,10 @@ def register_pair(
                 buffer=buffer,
                 grid_spacing=grid_spacing,
                 tissue_cutoff=tissue_cutoff,
+                rbf_smoothing=rbf_smoothing,
+                n_passes=elastic_passes,
+                keep_if_improves=keep_if_improves,
+                verbose=verbose,
             )
             aligned = apply_elastic_transform(aligned, displacement, (fh, fw),
                                               default_value=bg)
@@ -727,10 +944,11 @@ def register_pair(
                 aligned_mask.astype(np.uint8), displacement, (fh, fw),
                 default_value=0.0, is_label=True,
             ).astype(bool)
+            iou = compute_iou(fixed_mask, aligned_mask)
             if verbose:
-                print(f"    [elastic] done", flush=True)
+                print(f"    [elastic] done (IoU {iou_affine:.4f} -> {iou:.4f})", flush=True)
 
-    return aligned, aligned_mask, iou_affine, M, displacement
+    return aligned, aligned_mask, iou, M, displacement
 
 
 def crop_to_valid(

@@ -41,6 +41,10 @@ def _read_level(path: str, level: int) -> np.ndarray:
 
 def _extract_trailing_number(path: str) -> int:
     stem = os.path.splitext(os.path.basename(path))[0]
+    # Prefer slide-N pattern; fall back to last number in the name
+    m = re.search(r'slide-(\d+)', stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
     m = re.search(r'(\d+)\s*$', stem)
     if m:
         return int(m.group(1))
@@ -83,6 +87,9 @@ def align_serial_sections(
     buffer: int = 200,
     grid_spacing: int = 150,
     tissue_cutoff: float = 0.15,
+    elastic_passes: int = 3,
+    rbf_smoothing: float = 0.1,
+    keep_if_improves: bool = True,
     extension: str = ".ndpi",
     save_aligned: bool = True,
     save_masks: bool = False,
@@ -277,6 +284,9 @@ def align_serial_sections(
                 grid_spacing=grid_spacing,
                 tissue_cutoff=tissue_cutoff,
                 iou_threshold=0.0,
+                elastic_passes=elastic_passes,
+                rbf_smoothing=rbf_smoothing,
+                keep_if_improves=keep_if_improves,
                 verbose=verbose,
             )
 
@@ -299,21 +309,27 @@ def align_serial_sections(
                 ref_idx = idx
             else:
                 if verbose:
-                    print(f"  FAIL below threshold {iou_threshold} (IoU={iou:.4f}), trying all skip candidates...")
+                    print(f"  FAIL below threshold {iou_threshold} (IoU={iou:.4f}), probing alternate references for this slide...")
 
+                # Probe other references (affine only) to find the one that best
+                # aligns THIS slide. Each candidate keeps its fixed image so the
+                # winner can be re-registered at full quality and saved.
                 behind_candidates = [
                     indices[j] for j in range(i_pos - 1, max(i_pos - max_skip - 1, -1), -1)
                     if indices[j] in aligned_cache
                 ]
                 ahead_candidates = _get_skip_candidates(idx, indices, max_skip)
-                candidate_results = []
+
+                # Seed with the result we already computed against the current reference.
+                candidate_results = [(iou, ref_idx, ref_img)]
 
                 for cand_idx in behind_candidates:
+                    if cand_idx == ref_idx:
+                        continue
                     if verbose:
                         print(f"  Probing behind [{cand_idx}] (affine only) ...", end=" ", flush=True)
-                    cand_ref_img = aligned_cache[cand_idx]
                     _, _, cand_iou, _, _ = register_pair(
-                        fixed=cand_ref_img, moving=moving_img,
+                        fixed=aligned_cache[cand_idx], moving=moving_img,
                         g_thresh=g_thresh, affine_method=affine_method,
                         do_elastic=False, tile_size=tile_size, buffer=buffer,
                         grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
@@ -321,18 +337,17 @@ def align_serial_sections(
                     )
                     if verbose:
                         print(f"IoU={cand_iou:.4f}")
-                    candidate_results.append((cand_iou, cand_idx, cand_ref_img, moving_img, slide_stem, "behind", idx))
+                    candidate_results.append((cand_iou, cand_idx, aligned_cache[cand_idx]))
 
-                ahead_imgs = {}
                 for skip_idx in ahead_candidates:
-                    #  Pad skip candidate too
-                    skip_img = _pad_image(_read_level(slides[skip_idx], level))
-                    skip_stem = Path(slides[skip_idx]).stem
-                    ahead_imgs[skip_idx] = (skip_img, skip_stem)
+                    # An ahead slide can only be a reference if it has already been
+                    # aligned; otherwise it is not yet in a usable coordinate frame.
+                    if skip_idx not in aligned_cache:
+                        continue
                     if verbose:
                         print(f"  Probing ahead [{skip_idx}] (affine only) ...", end=" ", flush=True)
                     _, _, skip_iou, _, _ = register_pair(
-                        fixed=ref_img, moving=skip_img,
+                        fixed=aligned_cache[skip_idx], moving=moving_img,
                         g_thresh=g_thresh, affine_method=affine_method,
                         do_elastic=False, tile_size=tile_size, buffer=buffer,
                         grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
@@ -340,76 +355,52 @@ def align_serial_sections(
                     )
                     if verbose:
                         print(f"IoU={skip_iou:.4f}")
-                    candidate_results.append((skip_iou, ref_idx, ref_img, skip_img, skip_stem, "ahead", skip_idx))
+                    candidate_results.append((skip_iou, skip_idx, aligned_cache[skip_idx]))
 
-                found_good = False
-                if candidate_results:
-                    candidate_results.sort(key=lambda x: x[0], reverse=True)
-                    best_iou, best_ref_idx, best_fixed_img, best_moving_img, best_stem, best_dir, best_save_idx = candidate_results[0]
+                # Pick the reference that best aligns THIS slide.
+                candidate_results.sort(key=lambda x: x[0], reverse=True)
+                best_iou, best_ref_idx, best_ref_img = candidate_results[0]
 
+                if best_ref_idx == ref_idx:
+                    # Current reference was already best — reuse what we computed.
+                    final_aligned, final_mask, final_iou = aligned, aligned_mask, iou
+                    final_M, final_disp = M, displacement
+                else:
                     if verbose:
-                        print(f"  Best candidate: save=[{best_save_idx}] ref=[{best_ref_idx}] ({best_dir}) IoU={best_iou:.4f}")
-
-                    if best_iou > iou:
-                        best_aligned, best_mask, best_iou_final, best_M, best_disp = register_pair(
-                            fixed=best_fixed_img, moving=best_moving_img,
-                            g_thresh=g_thresh, affine_method=affine_method,
-                            do_elastic=do_elastic, tile_size=tile_size, buffer=buffer,
-                            grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
-                            iou_threshold=0.0,
-                            verbose=verbose,
-                        )
-
-                        if best_dir == "ahead":
-                            for skipped_idx in _indices_between(idx, best_save_idx, indices):
-                                skipped_stem = Path(slides[skipped_idx]).stem
-                                results[skipped_idx] = AlignmentResult(
-                                    slide_path=slides[skipped_idx], index=skipped_idx,
-                                    reference_index=best_ref_idx, iou=0.0, skipped=True,
-                                    notes="skipped (damaged/low IoU)",
-                                )
-                                _save_transform(None, None, affine_dir, elastic_dir, skipped_stem,
-                                                slide_index=skipped_idx, reference_index=best_ref_idx,
-                                                level=level, notes="skipped (damaged/low IoU)")
-
-                        accepted_note = "OK" if best_iou_final >= iou_threshold else "WARN best available"
-                        if verbose:
-                            print(f"  {accepted_note} best candidate accepted (IoU={best_iou_final:.4f})")
-
-                        results[best_save_idx] = AlignmentResult(
-                            slide_path=slides[best_save_idx], index=best_save_idx,
-                            reference_index=best_ref_idx, iou=best_iou_final, affine_matrix=best_M,
-                            notes="" if best_iou_final >= iou_threshold else f"low IoU ({best_iou_final:.4f}), best available",
-                        )
-                        if save_aligned:
-                            _save_image(best_aligned, aligned_dir / f"{best_stem}.png")
-                        if save_masks:
-                            _save_image(best_mask.astype(np.uint8) * 255,
-                                        masks_dir / f"{best_stem}.png")
-                        _save_transform(best_M, best_disp, affine_dir, elastic_dir, best_stem,
-                                        slide_index=best_save_idx, reference_index=best_ref_idx, level=level,
-                                        notes="" if best_iou_final >= iou_threshold else f"low IoU ({best_iou_final:.4f}), best available")
-                        aligned_cache[best_save_idx] = best_aligned
-                        ref_img = best_aligned
-                        ref_idx = best_save_idx
-                        found_good = True
-
-                if not found_good:
-                    if verbose:
-                        print(f"  No good candidate found; accepting [{idx}] with IoU={iou:.4f}")
-                    results[idx] = AlignmentResult(
-                        slide_path=slides[idx], index=idx,
-                        reference_index=ref_idx, iou=iou, affine_matrix=M,
-                        notes=f"low IoU ({iou:.4f}), no skip succeeded",
+                        print(f"  Better reference [{best_ref_idx}] (affine IoU={best_iou:.4f}); "
+                              f"re-registering at full quality...")
+                    final_aligned, final_mask, final_iou, final_M, final_disp = register_pair(
+                        fixed=best_ref_img, moving=moving_img,
+                        g_thresh=g_thresh, affine_method=affine_method,
+                        do_elastic=do_elastic, tile_size=tile_size, buffer=buffer,
+                        grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
+                        iou_threshold=0.0, elastic_passes=elastic_passes,
+                        rbf_smoothing=rbf_smoothing, keep_if_improves=keep_if_improves,
+                        verbose=verbose,
                     )
-                    if save_aligned:
-                        _save_image(aligned, aligned_dir / f"{slide_stem}.png")
-                    _save_transform(M, displacement, affine_dir, elastic_dir, slide_stem,
-                                    slide_index=idx, reference_index=ref_idx, level=level,
-                                    notes=f"low IoU ({iou:.4f})")
-                    aligned_cache[idx] = aligned
-                    ref_img = aligned
-                    ref_idx = idx
+
+                note = "" if final_iou >= iou_threshold else f"low IoU ({final_iou:.4f}), best available"
+                if verbose:
+                    accepted = "OK" if final_iou >= iou_threshold else "WARN best available"
+                    print(f"  {accepted} accepted (IoU={final_iou:.4f}, ref=[{best_ref_idx}])")
+
+                # Always save idx — every slide gets an output image.
+                results[idx] = AlignmentResult(
+                    slide_path=slides[idx], index=idx,
+                    reference_index=best_ref_idx, iou=final_iou, affine_matrix=final_M,
+                    notes=note,
+                )
+                if save_aligned:
+                    _save_image(final_aligned, aligned_dir / f"{slide_stem}.png")
+                if save_masks:
+                    _save_image(final_mask.astype(np.uint8) * 255,
+                                masks_dir / f"{slide_stem}.png")
+                _save_transform(final_M, final_disp, affine_dir, elastic_dir, slide_stem,
+                                slide_index=idx, reference_index=best_ref_idx, level=level,
+                                notes=note)
+                aligned_cache[idx] = final_aligned
+                ref_img = final_aligned
+                ref_idx = idx
 
     forward_indices = list(range(mid + 1, n))
     if verbose and forward_indices:
@@ -458,20 +449,6 @@ def _get_skip_candidates(
         return []
     candidates = ordered_indices[pos + 1: pos + 1 + max_skip]
     return candidates
-
-
-def _indices_between(
-    start_idx: int,
-    end_idx: int,
-    ordered_indices: List[int],
-) -> List[int]:
-    """Return ordered_indices strictly between start_idx and end_idx (inclusive of start)."""
-    try:
-        pos_start = ordered_indices.index(start_idx)
-        pos_end = ordered_indices.index(end_idx)
-    except ValueError:
-        return []
-    return ordered_indices[pos_start: pos_end]  # includes start, excludes end
 
 
 # other helpers
