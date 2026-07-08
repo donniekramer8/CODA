@@ -27,7 +27,9 @@ Raw WSIs (.ndpi)
 │
 └─── [align_serial_sections.ipynb]  Register serial sections (affine → elastic)
           ↓
-     [apply_transforms.ipynb]  Warp segmentation masks using saved transforms
+     [apply_transforms.ipynb]          Warp label maps / images using saved transforms
+     [apply_transforms_IF_channels.ipynb]  Warp N-channel IF-prediction tifs
+     [roi_fullres.py]                  Extract a full-resolution ROI in the aligned frame
 ```
 
 ---
@@ -51,10 +53,12 @@ CODA/
 │       ├── make_mosaic.ipynb          # Step 1: WSI + XML → mosaic canvas
 │       └── make_tiles.ipynb           # Step 2: mosaic → random-crop tile dataset
 └── alignment/
-    ├── alignment_pipeline.py          # Orchestration: sorting, anchoring, pass logic
-    ├── registration.py                # Affine (ORB/ECC) + elastic (phase-correlation) registration
-    ├── align_serial_sections.ipynb    # Run alignment pipeline interactively
-    └── apply_transforms.ipynb         # Warp new images using saved transforms
+    ├── alignment_pipeline.py              # Orchestration: sorting, anchoring, pass logic
+    ├── registration.py                    # Affine (ORB/ECC/combined) + elastic (phase-correlation) registration
+    ├── roi_fullres.py                     # Map a saved transform to level-0; extract a full-res ROI in the aligned frame
+    ├── align_serial_sections.ipynb        # Run alignment pipeline interactively
+    ├── apply_transforms.ipynb             # Warp new images (label maps / RGB) using saved transforms
+    └── apply_transforms_IF_channels.ipynb # Warp N-channel IF-prediction tifs using saved transforms
 ```
 
 ---
@@ -113,7 +117,7 @@ Reads the saved mosaic and randomly crops it into fixed-size tiles with a spatia
 
 ### Step 4 — Train
 
-Edit [tissue_segmentation/src/config.py](tissue_segmentation/src/config.py) to point `TRAIN_NPZ` and `VAL_NPZ` at your `.npz` files, then:
+Edit [tissue_segmentation/src/config.py](tissue_segmentation/src/config.py) to point `TRAIN_DATA_PATH` and `VAL_DATA_PATH` at your `.npz` files, then:
 
 ```bash
 cd tissue_segmentation
@@ -124,13 +128,16 @@ Key config options:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `BACKBONE` | `convnext_tiny` | ConvNeXt variant (`tiny`, `base`, `large`) |
+| `CONVNEXT_VARIANT` | `tiny` | ConvNeXt backbone variant (`tiny`, `base`, `large`) |
 | `NUM_CLASSES` | `10` | Segmentation classes including background |
+| `IN_CHANNELS` | `3` | Input channels (RGB) |
 | `TILE_SIZE` | `256` | Input tile size in pixels |
 | `BATCH_SIZE` | `4` | Training batch size |
-| `LR` | `1e-4` | Initial learning rate |
-| `MAX_EPOCHS` | `100` | Maximum training epochs |
-| `EARLY_STOP_PATIENCE` | `15` | Epochs without improvement before stopping |
+| `LEARNING_RATE` | `1e-4` | Initial learning rate |
+| `WEIGHT_DECAY` | `1e-2` | AdamW weight decay |
+| `EPOCHS` | `100` | Maximum training epochs |
+| `WARMUP_EPOCHS` | `5` | Linear-warmup epochs before cosine annealing |
+| `EARLY_STOPPING_PATIENCE` | `15` | Epochs without improvement before stopping |
 
 Training uses:
 - **Loss**: CrossEntropyLoss with inverse-frequency class weighting (background excluded)
@@ -159,30 +166,39 @@ python inference/wsi_inference.py \
     --out /path/to/output/
 ```
 
-**Batch (directory of `.ndpi` files):**
+**Batch (directory of `.ndpi` files, searched recursively):**
 
 ```bash
 python inference/batch_wsi_inference.py \
-    --folder /path/to/slides/ \
+    --ndpi_dir /path/to/slides/ \
     --checkpoint src/checkpoints/best_model.pth \
-    --out /path/to/output/
+    --out_dir /path/to/output/ \
+    --level 1 \
+    --save_scale 8 \
+    --no_colormap
 ```
+
+Batch inference skips slides whose output PNG already exists, so it is safe to re-run.
 
 Inference pipeline:
 1. Green-channel tissue masking to skip background regions
-2. 1024×1024 tiles with 128-pixel overlap
+2. Tiled inference with overlap
 3. Gaussian-weighted blending to eliminate tile boundary artifacts
 4. Output: integer label map + optional colormap PNG
 
-Key inference flags:
+Key inference flags (same for both scripts, except the input/output flag names):
 
 | Flag | Default | Description |
 |---|---|---|
-| `--level` | `0` | WSI pyramid level to read |
-| `--tile-size` | `1024` | Inference tile size |
-| `--overlap` | `128` | Overlap between adjacent tiles |
-| `--scale` | `4` | Output downscale factor |
-| `--no-colormap` | — | Skip colormap PNG output |
+| `--ndpi` / `--ndpi_dir` | — | Input slide (single) or folder (batch, recursive) |
+| `--out` / `--out_dir` | — | Output directory for label maps |
+| `--level` | `1` | WSI pyramid level to read |
+| `--tile_size` | `256` (`config.TILE_SIZE`) | Inference tile size |
+| `--overlap` | `64` | Overlap between adjacent tiles |
+| `--batch_size` | `4` | Tiles per forward pass |
+| `--g_thresh` | `190` | Green-channel tissue threshold |
+| `--save_scale` | `4` | Output downscale factor |
+| `--no_colormap` | — | Skip colormap PNG output |
 
 ---
 
@@ -202,11 +218,24 @@ The recommended way to run alignment. Provides slide previews, a live summary ta
 |---|---|---|
 | `SLIDE_FOLDER` | — | Directory containing `.ndpi` files |
 | `OUTPUT_FOLDER` | — | Where to save aligned images and transforms |
-| `LEVEL` | `5` | Pyramid level for registration (higher = faster) |
-| `IOU_THRESHOLD` | `0.87` | Min tissue IoU to accept an alignment |
-| `MAX_SKIP` | `2` | Max consecutive damaged slides to skip |
+| `LEVEL` | `5` | Pyramid level for registration (higher = faster; level 5 ≈ 32× downsampled) |
+| `IOU_THRESHOLD` | `0.85` | Min tissue IoU to accept an alignment |
+| `MAX_SKIP` | `2` | Max consecutive damaged slides to probe for a better reference |
+| `G_THRESH` | `180` | Green-channel tissue threshold |
 | `AFFINE_METHOD` | `ORB` | `ORB`, `ECC`, or `combined` |
 | `DO_ELASTIC` | `True` | Whether to run elastic registration after affine |
+| `TILE_SIZE` | `800` | Elastic registration tile size (px at working level) |
+| `BUFFER` | `400` | Padding around image before tiling |
+| `GRID_SPACING` | `100` | Distance between elastic tile centres |
+| `TISSUE_CUTOFF` | `0.05` | Min tissue fraction in a tile to attempt elastic registration |
+| `ELASTIC_PASSES` | `3` | Number of coarse-to-fine elastic passes |
+| `RBF_SMOOTHING` | `0.05` | RBF smoothing of the displacement field (lower = sharper) |
+| `KEEP_IF_IMPROVES` | `True` | Auto-revert any pass that lowers grayscale NCC |
+| `PADDING` | `200` | White border (px at `LEVEL`) added before registration to avoid edge-cropping |
+
+> For range-based multi-section files (e.g. `*_Sec_1-9.ndpi`) or the section-manifest
+> format (`section_bbox_manifest.json`), use the `align_serial_sections_LC_CODA.ipynb`
+> variant instead.
 
 **Pipeline logic:**
 1. Slides are discovered and sorted by trailing number in filename
@@ -214,7 +243,8 @@ The recommended way to run alignment. Provides slide previews, a live summary ta
 3. A **forward pass** registers slides middle+1 → end
 4. A **backward pass** registers slides middle-1 → 0
 5. Each slide registers to the most recent successfully-aligned neighbor
-6. If IoU falls below `IOU_THRESHOLD`, the pipeline skips up to `MAX_SKIP` slides (damage/artifact handling)
+6. If IoU falls below `IOU_THRESHOLD`, the pipeline probes up to `MAX_SKIP` alternate references (behind and ahead, affine-only) and re-registers against whichever gives the best fit — so **every** slide still gets an output image, tagged in the metadata when it landed below threshold
+7. The run is resumable: slides whose transforms already exist on disk are skipped on re-run
 
 **Registration per pair:**
 1. **Affine** — ORB feature matching → RANSAC, or ECC intensity-based, or ORB-initialized multi-scale ECC
@@ -247,6 +277,45 @@ Use this after alignment to warp a separate set of images (e.g. segmentation lab
 | `REGISTRATION_LEVEL` | Pyramid level that was used during alignment |
 | `SEG_DOWNSAMPLE` | Downscale factor of the new images relative to level-0 |
 | `IS_LABEL_MAP` | `True` to use nearest-neighbor interpolation (label maps); `False` for bilinear |
+
+### Step 2b — Apply Transforms to Multi-channel IF Predictions
+
+**Notebook:** [alignment/apply_transforms_IF_channels.ipynb](alignment/apply_transforms_IF_channels.ipynb)
+
+A variant of `apply_transforms.ipynb` for warping `(H, W, N)` IF-prediction tifs
+(e.g. pix2pix DAPI/marker channels) through the saved H&E registration. It writes
+the warped combined tif plus one subfolder per channel.
+
+**Additional configuration (beyond `apply_transforms.ipynb`):**
+
+| Variable | Description |
+|---|---|
+| `NEW_IMAGE_EXT` | Extension of the images to warp (default `.tif`) |
+| `PADDING` | Padding (registration-level px) that was used during alignment |
+| `CHANNEL_NAMES` | Per-channel subfolder names; extra channels fall back to `ch{i}` |
+| `FILL_VALUE` | Border fill for warped output (IF background = `0`) |
+| `SAVE_COMBINED_TIF` | Also write the full N-channel warped tif |
+
+### Step 3 — Extract a Full-Resolution ROI in the Aligned Frame
+
+**Module:** [alignment/roi_fullres.py](alignment/roi_fullres.py)
+
+After alignment (done at a low pyramid level), use this to pull a region of
+interest at **level-0 resolution** in the common anchor frame — without loading
+whole slides. You pick an ROI box once in the anchor's aligned frame; for each
+slide the ROI is mapped back through that slide's saved affine + elastic
+transform to its own level-0 image, only the needed region is read from the
+`.ndpi` (via `pyvips.extract_area`), and it is warped into the shared ROI frame.
+
+```python
+from roi_fullres import extract_roi
+
+# roi is (x, y, w, h) in the anchor level-0 aligned frame
+crop = extract_roi(slide_path, alignment_output_folder, roi_xywh=(x, y, w, h))
+```
+
+Returns an `(h, w, 3)` uint8 crop. Call it per slide to build a full-resolution
+aligned stack of the same ROI across the serial sections.
 
 ---
 
@@ -291,6 +360,7 @@ Check your CUDA version with `nvidia-smi`.
 | `.ndpi` | Whole-slide images (Hamamatsu; pyvips/OpenSlide compatible) |
 | Aperio ImageScope XML | Polygon annotations drawn on WSIs |
 | `.npz` | Packed tile datasets (`he`, `masks` arrays) |
+| `.tif` | Multi-channel IF-prediction images to warp through the alignment |
 | `.pth` | PyTorch model checkpoints |
 | `.pkl` | Affine transform matrices |
 | `.npy` | Elastic displacement fields |

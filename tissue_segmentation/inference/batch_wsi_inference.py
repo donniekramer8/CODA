@@ -15,7 +15,7 @@ VALID_EXTENSIONS = {".ndpi"}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Batch WSI inference — runs on every .ndpi in a folder."
+        description="Batch WSI inference — runs on every .ndpi in a folder." 
     )
     parser.add_argument("--ndpi_dir",   required=True,
                         help="Folder containing .ndpi files.")

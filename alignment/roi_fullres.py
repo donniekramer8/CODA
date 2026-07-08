@@ -14,7 +14,7 @@ This module lets you:
      .ndpi (via pyvips extract_area — tiled, no full-slide load), and warp it
      into the common anchor-frame ROI at full level-0 resolution.
 
-Coordinate conventions (VERIFIED against saved aligned PNGs, exact match)
+Coordinate conventions (VERIFIED against saved aligned PNGs, exact match) 
 -------------------------------------------------------------------------
 Forward (what the pipeline did at the registration level L), in order:
     1. raw_L  = read slide at level L                       (h0, w0)
