@@ -255,7 +255,12 @@ The recommended way to run alignment. Provides slide previews, a live summary ta
    - **Speed and output:** it runs on the GPU via torch when available, about 1 s per pair at level 5. The verbose log reports the mask Dice and a rotation-ambiguity *margin*; a margin near 0 means another rotation fits almost as well.
    - **Slide sizes:** the fit is done on each section as scanned, without stretching it to the reference canvas. The saved 2×3 matrix still applies after the canvas resize, so the `.pkl` format and the apply/ROI tools are unchanged.
    - **Alternatives:** `ORB` (feature matching → RANSAC), `ECC` (intensity-based), or `combined` (ORB-initialized multi-scale ECC) give a 6-DOF affine instead.
-2. **Elastic**: sparse phase-correlation grid → Gaussian-smoothed displacement field → thin-plate-spline dense field
+2. **Elastic (`DO_ELASTIC = True`)**: a coarse-to-fine refinement of the rigid result (`elastic_registration_multipass` in [alignment/registration.py](alignment/registration.py)). It works on grayscale images and the `G_THRESH` tissue masks. The fixed image is the neighbour's final (rigid + elastic) image.
+   - **One pass:** both images are padded by `BUFFER` px and blurred (σ = 3 px). Tiles of `TILE_SIZE` px are taken on a grid every `GRID_SPACING` px. A tile is used only if both sections have more than `TISSUE_CUTOFF` tissue in it. Each tile's shift is measured by sub-pixel phase correlation (Hanning window, tile downsampled 2×), run in both directions and averaged.
+   - **Dense field:** the sparse tile shifts are Gaussian-smoothed over the grid (σ = 2 grid points). A thin-plate spline then interpolates them into a dense displacement field (`RBF_SMOOTHING`; smaller = sharper). The spline is evaluated on a grid of at most 512 px and upsampled. With fewer than 4 usable tiles the field is zero.
+   - **Three passes (`ELASTIC_PASSES = 3`):** each pass measures the misalignment left after the field so far and adds its correction on top (the fields are composed). Tile size shrinks ×0.7 and spacing ×0.6 each pass. With the notebook settings that is tiles 800 → 560 → 392 px and spacing 100 → 60 → 36 px, so early passes fix broad warps and later ones local detail.
+   - **Keep only improvements (`KEEP_IF_IMPROVES = True`):** a pass is kept only if it raises grayscale NCC inside the overlap of the two tissue masks. Otherwise it is dropped, and the next, finer pass starts from the previous field.
+   - **Output:** the field is a pullback, `aligned(x) = rigid(x + d(x))`, applied with `cv2.remap`. It is saved as `transforms/elastic/<slide>.npy` (H × W × 2, in registration-level px). The IoU reported for the slide is measured after this step.
 
 **Output:**
 ```
