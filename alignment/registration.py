@@ -1,8 +1,10 @@
 """
 Serial section registration utilities.
 
-Provides affine and sparse-grid elastic registration of H&E tissue sections
-read from .ndpi whole-slide images.
+Two-step registration of H&E tissue sections read from .ndpi whole-slide images:
+1. Global: rigid FFT rotation search on tissue masks (default, see rigid_fft.py),
+   or ORB / ECC affine.
+2. Sparse-grid elastic refinement (phase correlation + thin-plate spline).
 """
 
 import numpy as np
@@ -11,6 +13,8 @@ import pyvips
 from scipy.ndimage import gaussian_filter
 from scipy.interpolate import RBFInterpolator
 from typing import Optional, Tuple
+
+from rigid_fft import fft_rigid_register
 
 
 # ── I/O helpers ────────────────────────────────────────────────────────────────
@@ -234,6 +238,17 @@ def _match_size(moving: np.ndarray, fixed: np.ndarray) -> np.ndarray:
         interp = cv2.INTER_AREA if mh > fh else cv2.INTER_LINEAR
         moving = cv2.resize(moving, (fw, fh), interpolation=interp)
     return moving
+
+
+def _resize_matrix(src_shape, dst_shape) -> np.ndarray:
+    """3x3 map from pixel coordinates of an image to those of its cv2.resize to
+    dst_shape (what _match_size does). Pixel centres stay aligned:
+    x' = (x + 0.5) * s - 0.5."""
+    sy = dst_shape[0] / src_shape[0]
+    sx = dst_shape[1] / src_shape[1]
+    return np.array([[sx, 0, 0.5 * sx - 0.5],
+                     [0, sy, 0.5 * sy - 0.5],
+                     [0, 0, 1]], dtype=np.float64)
 
 
 def _bg_color(img: np.ndarray) -> tuple:
@@ -857,7 +872,7 @@ def register_pair(
     fixed: np.ndarray,
     moving: np.ndarray,
     g_thresh: int = 170,
-    affine_method: str = "ORB",
+    affine_method: str = "FFT",
     do_elastic: bool = True,
     tile_size: int = 400,
     buffer: int = 200,
@@ -867,17 +882,30 @@ def register_pair(
     elastic_passes: int = 3,
     rbf_smoothing: float = 0.1,
     keep_if_improves: bool = True,
+    fft_options: Optional[dict] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray], Optional[np.ndarray]]:
     """Full registration pipeline for one (fixed, moving) pair.
 
-    IoU is evaluated after affine. Elastic registration only runs if the
-    affine IoU meets iou_threshold (it is a refinement step, not a recovery step).
+    Step 1 (global), chosen by affine_method:
+        "FFT"  (default) – rigid (rotation + translation). An exhaustive FFT
+                 rotation search on automatic tissue masks; see
+                 rigid_fft.fft_rigid_register. `fft_options` is passed through
+                 to it, e.g. {"allow_flips": True, "backend": "numpy",
+                 "mask_kwargs": {"offset": 5}}.
+        "ORB" / "ECC" / "combined" – 6-DOF affine; see estimate_affine_transform.
+
+    IoU is evaluated after step 1. Elastic registration (step 2) only runs if
+    that IoU meets iou_threshold (it is a refinement step, not a recovery step).
+
+    The returned affine_M always applies to `moving` *after* it has been resized
+    to fixed's shape (_match_size), as apply_transforms / roi_fullres replay it.
 
     Returns:
         (aligned_image, aligned_mask, iou_after_affine, affine_M, displacement_field)
         displacement_field is (H, W, 2) float32 or None.
     """
+    moving_raw = moving
     moving = _match_size(moving, fixed)
     fh, fw = fixed.shape[:2]
 
@@ -890,17 +918,36 @@ def register_pair(
     fixed_gray  = _to_gray(fixed)
     moving_gray = _to_gray(moving)
 
-    # 1. Affine
-    if verbose:
-        print(f"    [affine/{affine_method}] estimating transform ...", flush=True)
-    M, affine_score = estimate_affine_transform(
-        fixed_gray, moving_gray,
-        fixed_mask=fixed_mask.astype(np.uint8),
-        moving_mask=moving_mask.astype(np.uint8),
-        method=affine_method,
-    )
-    if verbose:
-        print(f"    [affine/{affine_method}] done (score={affine_score:.4f})", flush=True)
+    # 1. Global: rigid FFT (default) or affine
+    if affine_method.upper() == "FFT":
+        if verbose:
+            print("    [rigid/FFT] rotation search on tissue masks ...", flush=True)
+        # Fit on moving as scanned. _match_size stretches it anisotropically
+        # whenever slide sizes differ, which a rigid transform can't undo.
+        # Then express the result for the resized image: M = T @ R^-1.
+        T, fft_info = fft_rigid_register(fixed, moving_raw, **(fft_options or {}))
+        M = (T @ np.linalg.inv(_resize_matrix(moving_raw.shape, fixed.shape)))[:2]
+        if verbose:
+            flags = []
+            if fft_info["margin"] < 0.01:
+                flags.append("AMBIGUOUS rotation (small margin)")
+            if fft_info["flipped"]:
+                flags.append("mirrored section")
+            print(f"    [rigid/FFT] done (Dice={fft_info['score']:.4f}, "
+                  f"angle={fft_info['angle_deg']:.2f} deg, margin={fft_info['margin']:.3f}, "
+                  f"{fft_info['backend']}, {fft_info['seconds']:.1f}s)"
+                  + (f"  ! {', '.join(flags)}" if flags else ""), flush=True)
+    else:
+        if verbose:
+            print(f"    [affine/{affine_method}] estimating transform ...", flush=True)
+        M, affine_score = estimate_affine_transform(
+            fixed_gray, moving_gray,
+            fixed_mask=fixed_mask.astype(np.uint8),
+            moving_mask=moving_mask.astype(np.uint8),
+            method=affine_method,
+        )
+        if verbose:
+            print(f"    [affine/{affine_method}] done (score={affine_score:.4f})", flush=True)
 
     aligned = apply_affine(moving, M, (fh, fw), border_value=bg)
     aligned_mask_u8 = apply_affine(

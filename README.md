@@ -3,7 +3,7 @@
 A two-module pipeline for H&E histopathology whole-slide image (WSI) analysis:
 
 1. **Tissue Segmentation** — annotate, tile, and train a ConvNeXt-UNet model for semantic segmentation
-2. **Serial Section Alignment** — affine + elastic registration of consecutive tissue sections
+2. **Serial Section Alignment** — rigid (FFT on tissue masks) + elastic registration of consecutive tissue sections
 
 Adapted and refactored based on:
 Kiemen, A.L., Braxton, A.M., Grahn, M.P. et al. CODA: quantitative 3D reconstruction of large tissues at cellular resolution. Nat Methods 19, 1490–1499 (2022). https://doi.org/10.1038/s41592-022-01650-9
@@ -25,7 +25,7 @@ Raw WSIs (.ndpi)
 │         ↓
 │    [wsi_inference.py / batch_wsi_inference.py]  Run inference on new WSIs
 │
-└─── [align_serial_sections.ipynb]  Register serial sections (affine → elastic)
+└─── [align_serial_sections.ipynb]  Register serial sections (rigid FFT → elastic)
           ↓
      [apply_transforms.ipynb]          Warp label maps / images using saved transforms
      [apply_transforms_IF_channels.ipynb]  Warp N-channel IF-prediction tifs
@@ -54,7 +54,8 @@ CODA/
 │       └── make_tiles.ipynb           # Step 2: mosaic → random-crop tile dataset
 └── alignment/
     ├── alignment_pipeline.py              # Orchestration: sorting, anchoring, pass logic
-    ├── registration.py                    # Affine (ORB/ECC/combined) + elastic (phase-correlation) registration
+    ├── registration.py                    # Rigid FFT (default) or affine (ORB/ECC/combined) + elastic (phase-correlation) registration
+    ├── rigid_fft.py                       # Rigid FFT rotation search on tissue masks (the default first step)
     ├── roi_fullres.py                     # Map a saved transform to level-0; extract a full-res ROI in the aligned frame
     ├── align_serial_sections.ipynb        # Run alignment pipeline interactively
     ├── apply_transforms.ipynb             # Warp new images (label maps / RGB) using saved transforms
@@ -222,8 +223,9 @@ The recommended way to run alignment. Provides slide previews, a live summary ta
 | `IOU_THRESHOLD` | `0.85` | Min tissue IoU to accept an alignment |
 | `MAX_SKIP` | `2` | Max consecutive damaged slides to probe for a better reference |
 | `G_THRESH` | `180` | Green-channel tissue threshold |
-| `AFFINE_METHOD` | `ORB` | `ORB`, `ECC`, or `combined` |
-| `DO_ELASTIC` | `True` | Whether to run elastic registration after affine |
+| `AFFINE_METHOD` | `FFT` | First (global) step: `FFT` = rigid FFT rotation search on tissue masks; `ORB`, `ECC`, or `combined` = affine |
+| `FFT_OPTIONS` | `{}` | Options for the FFT step, e.g. `{"allow_flips": True}` (also fit mirrored sections), `{"backend": "numpy"}` (default `auto` = torch on GPU if available), `{"mask_kwargs": {"offset": 5}}` (more inclusive tissue mask) |
+| `DO_ELASTIC` | `True` | Whether to run elastic registration after the global step |
 | `TILE_SIZE` | `800` | Elastic registration tile size (px at working level) |
 | `BUFFER` | `400` | Padding around image before tiling |
 | `GRID_SPACING` | `100` | Distance between elastic tile centres |
@@ -247,8 +249,13 @@ The recommended way to run alignment. Provides slide previews, a live summary ta
 7. The run is resumable: slides whose transforms already exist on disk are skipped on re-run
 
 **Registration per pair:**
-1. **Affine** — ORB feature matching → RANSAC, or ECC intensity-based, or ORB-initialized multi-scale ECC
-2. **Elastic** — sparse phase-correlation grid → Gaussian-smoothed displacement field → thin-plate-spline dense field
+1. **Rigid (default, `AFFINE_METHOD = "FFT"`)**: an exhaustive rotation search on tissue masks ([alignment/rigid_fft.py](alignment/rigid_fft.py)).
+   - **Masks:** each section is masked with an automatic green-channel threshold (triangle method). Small gaps are closed, dust is dropped, pieces touching the slide/scan edge (coverslip edges) are dropped, and small holes are filled while lumens are kept. Padding and warp fill are ignored, so a padded section gets the same mask as the bare scan.
+   - **Search:** for each candidate angle the moving mask is rotated, and its overlap with the fixed mask is computed for every translation at once by FFT cross-correlation. The best (angle, shift) maximizes mask Dice. The search covers the full circle every 3° on a 256 px canvas, then ±3° in 0.25° steps at full resolution, with sub-degree / sub-pixel parabola refinement.
+   - **Speed and output:** it runs on the GPU via torch when available, about 1 s per pair at level 5. The verbose log reports the mask Dice and a rotation-ambiguity *margin*; a margin near 0 means another rotation fits almost as well.
+   - **Slide sizes:** the fit is done on each section as scanned, without stretching it to the reference canvas. The saved 2×3 matrix still applies after the canvas resize, so the `.pkl` format and the apply/ROI tools are unchanged.
+   - **Alternatives:** `ORB` (feature matching → RANSAC), `ECC` (intensity-based), or `combined` (ORB-initialized multi-scale ECC) give a 6-DOF affine instead.
+2. **Elastic**: sparse phase-correlation grid → Gaussian-smoothed displacement field → thin-plate-spline dense field
 
 **Output:**
 ```
@@ -256,7 +263,7 @@ OUTPUT_FOLDER/
 ├── aligned/          # Registered PNG images
 ├── masks/            # Tissue masks
 ├── transforms/
-│   ├── affine/       # Affine matrices (.pkl, 2×3)
+│   ├── affine/       # Global-step matrices (.pkl, 2×3, applied after the canvas resize)
 │   └── elastic/      # Displacement fields (.npy, H×W×2)
 └── alignment_results.json
 ```

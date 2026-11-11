@@ -81,7 +81,7 @@ def align_serial_sections(
     iou_threshold: float = 0.9,
     max_skip: int = 3,
     g_thresh: int = 170,
-    affine_method: str = "ORB",
+    affine_method: str = "FFT",
     do_elastic: bool = True,
     tile_size: int = 400,
     buffer: int = 200,
@@ -90,6 +90,7 @@ def align_serial_sections(
     elastic_passes: int = 3,
     rbf_smoothing: float = 0.1,
     keep_if_improves: bool = True,
+    fft_options: Optional[dict] = None,
     extension: str = ".ndpi",
     save_aligned: bool = True,
     save_masks: bool = False,
@@ -114,9 +115,13 @@ def align_serial_sections(
         level:               Pyramid level to read for registration (higher = smaller).
         iou_threshold:       Minimum tissue IoU to accept a registration.
         max_skip:            Max consecutive slides to skip when IoU is too low.
-        g_thresh:            Green-channel threshold for tissue masking.
-        affine_method:       "ECC", "ORB", or "combined".
-        do_elastic:          Whether to run elastic registration after affine.
+        g_thresh:            Green-channel threshold for tissue masking (IoU + elastic;
+                             the FFT step thresholds each image automatically).
+        affine_method:       Global first step. "FFT" (default): rigid FFT rotation
+                             search on tissue masks. "ORB", "ECC", "combined": affine.
+        fft_options:         Options for the FFT step (rigid_fft.fft_rigid_register),
+                             e.g. {"allow_flips": True, "mask_kwargs": {"offset": 5}}.
+        do_elastic:          Whether to run elastic registration after the global step.
         elastic_grid_spacing: B-spline grid spacing.
         elastic_iterations:  Max B-spline optimizer iterations.
         extension:           Slide file extension.
@@ -287,6 +292,7 @@ def align_serial_sections(
                 elastic_passes=elastic_passes,
                 rbf_smoothing=rbf_smoothing,
                 keep_if_improves=keep_if_improves,
+                fft_options=fft_options,
                 verbose=verbose,
             )
 
@@ -333,7 +339,7 @@ def align_serial_sections(
                         g_thresh=g_thresh, affine_method=affine_method,
                         do_elastic=False, tile_size=tile_size, buffer=buffer,
                         grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
-                        iou_threshold=0.0, verbose=False,
+                        iou_threshold=0.0, fft_options=fft_options, verbose=False,
                     )
                     if verbose:
                         print(f"IoU={cand_iou:.4f}")
@@ -351,7 +357,7 @@ def align_serial_sections(
                         g_thresh=g_thresh, affine_method=affine_method,
                         do_elastic=False, tile_size=tile_size, buffer=buffer,
                         grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
-                        iou_threshold=0.0, verbose=False,
+                        iou_threshold=0.0, fft_options=fft_options, verbose=False,
                     )
                     if verbose:
                         print(f"IoU={skip_iou:.4f}")
@@ -376,7 +382,7 @@ def align_serial_sections(
                         grid_spacing=grid_spacing, tissue_cutoff=tissue_cutoff,
                         iou_threshold=0.0, elastic_passes=elastic_passes,
                         rbf_smoothing=rbf_smoothing, keep_if_improves=keep_if_improves,
-                        verbose=verbose,
+                        fft_options=fft_options, verbose=verbose,
                     )
 
                 note = "" if final_iou >= iou_threshold else f"low IoU ({final_iou:.4f}), best available"
@@ -585,10 +591,15 @@ if __name__ == "__main__":
     parser.add_argument("--max-skip", type=int, default=3,
                         help="Max slides to skip for damaged sections (default: 3).")
     parser.add_argument("--no-elastic", action="store_true",
-                        help="Skip elastic registration (affine only).")
-    parser.add_argument("--affine-method", default="combined",
-                        choices=["ECC", "ORB", "combined"],
-                        help="Affine estimation method (default: combined).")
+                        help="Skip elastic registration (global step only).")
+    parser.add_argument("--affine-method", default="FFT",
+                        choices=["FFT", "ECC", "ORB", "combined"],
+                        help="Global first step: FFT = rigid FFT rotation search on tissue "
+                             "masks (default); ECC / ORB / combined = affine.")
+    parser.add_argument("--allow-flips", action="store_true",
+                        help="FFT: also fit the mirrored section and use it if clearly better.")
+    parser.add_argument("--fft-backend", default="auto", choices=["auto", "torch", "numpy"],
+                        help="FFT backend (default: auto = torch on GPU if available).")
     parser.add_argument("--g-thresh", type=int, default=170,
                         help="Green-channel threshold for tissue mask (default: 170).")
     parser.add_argument("--extension", default=".ndpi",
@@ -605,5 +616,6 @@ if __name__ == "__main__":
         g_thresh=args.g_thresh,
         affine_method=args.affine_method,
         do_elastic=not args.no_elastic,
+        fft_options={"allow_flips": args.allow_flips, "backend": args.fft_backend},
         extension=args.extension,
     )
